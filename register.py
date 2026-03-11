@@ -17,8 +17,9 @@ import os
 import sys
 import threading
 import time
+from collections import Counter
 from typing import Callable, Dict, List, Optional, Any
-from urllib.parse import unquote
+from urllib.parse import unquote, quote
 
 import requests as _requests
 import urllib3
@@ -572,10 +573,12 @@ def run_pool_probe(
 
     def probe_one(f):
         nonlocal checked
-        name = f.get("name") or f.get("id", "")
+        name = f.get("name") or ""
+        file_id = f.get("id") or ""
+        display_name = name or file_id or ""
         auth_index = f.get("auth_index")
         if not auth_index:
-            log(f"[Pool] 跳过(缺少 auth_index): {name}")
+            log(f"[Pool] 跳过(缺少 auth_index): {display_name}")
             with checked_lock:
                 checked += 1
                 if checked == 1 or checked % 20 == 0 or checked == len(target_files):
@@ -594,12 +597,12 @@ def run_pool_probe(
             status_code = data.get("status_code") if isinstance(data, dict) else None
             if status_code == 401:
                 with probe_lock:
-                    invalid_401.append({"name": name, "status": 401})
-                log(f"[Pool] 401: {name}")
+                    invalid_401.append({"name": name, "id": file_id, "status": 401})
+                log(f"[Pool] 401: {display_name}")
             elif status_code is None:
-                log(f"[Pool] 探测返回缺少 status_code: {name}")
+                log(f"[Pool] 探测返回缺少 status_code: {display_name}")
         except Exception as e:
-            log(f"[Pool] 探测异常: {name} - {e}")
+            log(f"[Pool] 探测异常: {display_name} - {e}")
         finally:
             with checked_lock:
                 checked += 1
@@ -674,25 +677,56 @@ def _delete_invalid_accounts(
     deleted = 0
     delete_fail = 0
     del_lock = threading.Lock()
+    fail_stats = Counter()
     token_dir = _resolve_token_dir(config or load_config())
     uploaded_dir = os.path.join(token_dir, "uploaded")
+
+    def _resp_detail(resp: Optional[_requests.Response]) -> str:
+        if not resp:
+            return ""
+        try:
+            data = resp.json()
+            return str(data)[:200]
+        except Exception:
+            text = resp.text if hasattr(resp, "text") else ""
+            return text[:200] if text else ""
 
     def delete_one(item):
         nonlocal deleted, delete_fail
         name = item.get("name", "")
-        if not name:
+        file_id = item.get("id") or ""
+        display_name = name or file_id or ""
+        if not display_name:
             with del_lock:
                 delete_fail += 1
             log("[Pool] 删除失败: 空文件名")
             return
         try:
-            r = session.delete(f"{base}/v0/management/auth-files/{name}", headers=headers, timeout=timeout)
-            with del_lock:
+            attempts = []
+            if file_id:
+                fid = str(file_id)
+                attempts.append(("id", f"{base}/v0/management/auth-files/{quote(fid, safe='')}"))
+                attempts.append(("id_query", f"{base}/v0/management/auth-files", {"id": fid}))
+            if name:
+                nm = str(name)
+                attempts.append(("name", f"{base}/v0/management/auth-files/{quote(nm, safe='')}"))
+                attempts.append(("name_query", f"{base}/v0/management/auth-files", {"name": nm}))
+                attempts.append(("filename_query", f"{base}/v0/management/auth-files", {"filename": nm}))
+
+            last_status: Optional[int] = None
+            last_label = ""
+            last_detail = ""
+            for label, url, *rest in attempts:
+                params = rest[0] if rest else None
+                r = session.delete(url, headers=headers, timeout=timeout, params=params)
+                last_status = r.status_code
+                last_label = label
                 if r.status_code in (200, 204):
-                    deleted += 1
-                    log(f"[Pool] 删除成功: {name}")
+                    with del_lock:
+                        deleted += 1
+                    log(f"[Pool] 删除成功: {display_name}")
                     # 同步删除本地副本（根目录和 uploaded/）
-                    clean_name = _normalize_token_name(name)
+                    clean_name = _normalize_token_name(name or display_name)
                     if clean_name:
                         for local_path in [
                             os.path.join(token_dir, f"{clean_name}.json"),
@@ -706,17 +740,28 @@ def _delete_invalid_accounts(
                                     log(f"[Pool] 本地删除失败: {clean_name} - {ex}")
                             else:
                                 log(f"[Pool] 本地不存在: {local_path}")
-                else:
-                    delete_fail += 1
-                    log(f"[Pool] 删除失败: {name} ({r.status_code})")
+                    return
+                last_detail = _resp_detail(r)
+                if r.status_code not in (404, 405):
+                    break
+
+            with del_lock:
+                delete_fail += 1
+                fail_stats[f"{last_status}:{last_label}"] += 1
+            detail_suffix = f" {last_detail}" if last_detail else ""
+            log(f"[Pool] 删除失败: {display_name} ({last_status}, {last_label}){detail_suffix}")
         except Exception as e:
             with del_lock:
                 delete_fail += 1
-            log(f"[Pool] 删除异常: {name} - {e}")
+                fail_stats["EXC:request"] += 1
+            log(f"[Pool] 删除异常: {display_name} - {e}")
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as ex:
         list(ex.map(delete_one, invalid_401))
 
+    if fail_stats:
+        stats_str = ", ".join([f"{k}={v}" for k, v in fail_stats.most_common(5)])
+        log(f"[Pool] 删除失败统计(前5): {stats_str}")
     log(f"[Pool] 清理完成: 删除成功={deleted}, 失败={delete_fail}")
     return {"deleted": deleted, "delete_fail": delete_fail}
 
@@ -1130,7 +1175,7 @@ def run_pool_maintain_cycle(
     log(f"[Daemon] 当前 {target_type} 账号数: {status['target']}")
 
     # 2. 清理 401 账号
-    clean_result = run_pool_clean(base_url, token, target_type, proxy, log_cb=log_cb)
+    clean_result = run_pool_clean(base_url, token, target_type, proxy, log_cb=log_cb, config=config)
     if not clean_result.get("ok"):
         log(f"[Daemon] 清理失败，跳过补号: {clean_result.get('error')}")
         return {"ok": False, "error": clean_result.get("error")}
